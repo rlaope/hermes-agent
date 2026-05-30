@@ -2329,7 +2329,15 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     # 169.254.169.254 / metadata.google.internal / ECS task metadata
     # via a browser, and routing those to a local Chromium sidecar
     # on an EC2/GCP/Azure host exfiltrates IAM credentials (#16234).
-    if not _is_local_backend() and _is_always_blocked_url(url):
+    #
+    # The floor is intentionally NOT gated on _is_local_backend(): the
+    # Camofox backend reports as "local" (see _is_local_backend) yet runs
+    # inside a Docker container that can still reach the host's metadata
+    # endpoint on a cloud VM. Gating the floor on the backend let a Camofox
+    # session navigate straight to IMDS. Only the private/internal-address
+    # check below is backend-gated (local network access is legitimate on a
+    # genuinely local host); the metadata floor is non-negotiable everywhere.
+    if _is_always_blocked_url(url):
         return json.dumps({
             "success": False,
             "error": "Blocked: URL targets a cloud metadata endpoint",
@@ -2397,13 +2405,14 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         # Skipped for local backends (same rationale as the pre-nav check),
         # and for the hybrid local sidecar (we're already on a local browser
         # hitting a private URL by design).
-        # Always-blocked floor (cloud metadata / IMDS) is enforced even
-        # when auto_local_this_nav is true — see pre-nav check for
-        # rationale (#16234).
+        # Always-blocked floor (cloud metadata / IMDS) is enforced on every
+        # backend (incl. Camofox/local) and even when auto_local_this_nav is
+        # true — see pre-nav check for rationale (#16234). It is also checked
+        # unconditionally of final_url != url: a meta-refresh / client-side
+        # redirect can land on IMDS without the top-level URL appearing to
+        # change, and the floor has no legitimate target to allow.
         if (
-            not _is_local_backend()
-            and final_url
-            and final_url != url
+            final_url
             and _is_always_blocked_url(final_url)
         ):
             _run_browser_command(nav_session_key, "open", ["about:blank"], timeout=10)

@@ -2,11 +2,16 @@
 the allow_private_urls setting.
 
 Local backends (Camofox, headless Chromium without a cloud provider) skip
-SSRF checks entirely — the agent already has full local-network access via
-the terminal tool.
+the ordinary private-IP SSRF check — the agent already has full local-network
+access via the terminal tool. They do NOT skip the always-blocked floor:
+cloud metadata / IMDS endpoints (169.254.169.254, metadata.google.internal,
+ECS task metadata, ...) are denied on every backend, because routing those to
+a container/sidecar on a cloud VM exfiltrates IAM credentials the shell's
+credential scoping never exposes.
 
 Cloud backends (Browserbase, BrowserUse) enforce SSRF by default.  Users
-can opt out for cloud mode via ``browser.allow_private_urls: true``.
+can opt out of the private-IP check for cloud mode via
+``browser.allow_private_urls: true`` — but never the metadata floor.
 """
 
 import json
@@ -161,6 +166,31 @@ class TestPreNavigationSsrf:
         ):
             result = json.loads(browser_tool.browser_navigate(private))
             assert result["success"] is True, f"Unexpected block for {private}: {result}"
+
+    # -- Always-blocked floor: Camofox-backend bypass regression ---------------
+
+    # Camofox reports as a *local* backend (_is_local_backend() is True), yet it
+    # runs inside a Docker container that can still reach the host's metadata
+    # endpoint on a cloud VM. Gating the always-blocked floor on
+    # `not _is_local_backend()` let a Camofox session navigate straight to IMDS
+    # and exfiltrate IAM credentials. The floor must fire on every backend; only
+    # the ordinary private-IP check stays local-gated. NOTE: these tests drive
+    # the REAL _is_local_backend() (via _is_camofox_mode), not a patched stub,
+    # so they pin the actual code path that was vulnerable.
+
+    @pytest.mark.parametrize("imds_url", IMDS_URLS)
+    def test_camofox_blocks_imds(self, monkeypatch, _common_patches, imds_url):
+        """Camofox (a 'local' backend) must NOT skip the metadata floor."""
+        monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: True)
+        monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: None)
+        # sanity: this configuration really is classified as a local backend
+        assert browser_tool._is_local_backend() is True
+        monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: False)
+
+        result = json.loads(browser_tool.browser_navigate(imds_url))
+
+        assert result["success"] is False
+        assert "cloud metadata endpoint" in result["error"]
 
 
 # ---------------------------------------------------------------------------
