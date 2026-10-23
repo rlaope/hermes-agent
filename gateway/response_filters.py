@@ -115,6 +115,7 @@ def is_explicit_response_skip(agent_result: dict | None) -> bool:
     return (
         isinstance(agent_result, dict) and agent_result.get("completed") is True
         and not agent_result.get("failed") and not agent_result.get("interrupted")
+        and not agent_result.get("partial")
         and not agent_result.get("error") and agent_result.get("turn_exit_reason") == "skip_response"
         and agent_result.get("final_response") == ""
     )

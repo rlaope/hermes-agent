@@ -559,6 +559,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                     return
                 tick = self._drain_queue()
                 if self._skip_response:
+                    # A consumer that never sent a draft must not seal another turn's stream.
+                    if self._last_sent_text:
+                        await self._abandon_native_stream()
                     await self._suppress_silence_marker()
                     return
 

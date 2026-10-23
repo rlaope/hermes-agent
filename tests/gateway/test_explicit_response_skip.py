@@ -1,5 +1,6 @@
 """Explicit response disposition survives live, queued and crash-left delivery."""
 
+import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -56,7 +57,8 @@ def test_crash_left_skip_receipt_is_settled_without_a_recovery_message(monkeypat
 
 
 @pytest.mark.parametrize("override", [
-    {"failed": True}, {"interrupted": True}, {"completed": False}, {"error": "storage failed"},
+    {"failed": True}, {"interrupted": True}, {"completed": False}, {"partial": True},
+    {"error": "storage failed"},
     {"turn_exit_reason": "text_response(finish_reason=stop)"}, {"final_response": "An ordinary answer."},
 ])
 def test_skip_outcome_never_hides_failures_or_ordinary_answers(override):
@@ -84,3 +86,65 @@ async def test_streaming_skip_does_not_finalize_with_a_placeholder_or_buffered_t
     adapter.edit_message.assert_not_awaited()
     assert all(frame["text"] == "" for frame in adapter.frames)
     assert not consumer.final_response_sent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("metadata", [{}, {"message_id": "skip-turn"}])
+async def test_skip_closes_a_running_relay_draft_without_intercepting_the_next_send(monkeypatch, metadata):
+    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+    from tests.gateway.relay.test_relay_live_cards import _connected_adapter
+
+    adapter, connector = _connected_adapter(supported_ops=("send", "edit", "typing", "draft"))
+    consumer = GatewayStreamConsumer(
+        adapter, "C1", StreamConsumerConfig(
+            transport="auto", chat_type="dm", edit_interval=0.01, buffer_threshold=1, cursor=""),
+        metadata=metadata,
+    )
+    draft_sent = asyncio.Event()
+    send_draft = adapter.send_draft
+
+    async def observe_draft(*args, **kwargs):
+        result = await send_draft(*args, **kwargs)
+        draft_sent.set()
+        return result
+
+    monkeypatch.setattr(adapter, "send_draft", observe_draft)
+    task = asyncio.create_task(consumer.run())
+    try:
+        consumer.on_delta("Current unfinalized preview")
+        await asyncio.wait_for(draft_sent.wait(), 2)
+        consumer.finish_silently()
+        await asyncio.wait_for(task, 2)
+
+        assert not adapter._open_draft_by_chat
+        frames = [frame for frame in connector.sent if frame["op"] == "draft"]
+        assert frames[-1]["final"] is True
+        assert frames[-1]["draft_id"] == frames[0]["draft_id"]
+        assert frames[-1]["content"] == frames[0]["content"]
+        assert not consumer.final_response_sent
+        await adapter.send("C1", "Unrelated next-turn notification")
+        assert connector.sent[-1]["op"] == "send"
+        assert connector.sent[-1]["content"] == "Unrelated next-turn notification"
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_skip_without_a_preview_does_not_close_another_turns_draft():
+    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+    from tests.gateway.relay.test_relay_live_cards import _connected_adapter
+
+    adapter, connector = _connected_adapter(supported_ops=("send", "edit", "typing", "draft"))
+    other_metadata = {"message_id": "other-turn"}
+    await adapter.send_draft("C1", 123, "Another turn's preview", metadata=other_metadata)
+    consumer = GatewayStreamConsumer(adapter, "C1", StreamConsumerConfig(transport="auto", chat_type="dm"))
+    consumer.finish_silently()
+    await asyncio.wait_for(consumer.run(), 2)
+
+    assert adapter._open_draft_by_chat == {"C1:turn:other-turn": 123}
+    assert all(frame["op"] == "draft" and frame["final"] is False for frame in connector.sent)
+    # Close the fixture-owned draft and prove teardown left no interception state.
+    await adapter.abandon_open_draft("C1", "Another turn's preview", metadata=other_metadata)
+    assert not adapter._open_draft_by_chat
